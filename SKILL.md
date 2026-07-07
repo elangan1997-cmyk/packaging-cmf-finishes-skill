@@ -113,28 +113,45 @@ print(f'Rendered: {os.path.getsize(\"/tmp/flat_render.png\")} bytes')
 "
 ```
 
-**5b. 检测刀模网格 + 拆分面板图片 + 制作标注图**
+**5b. 从 SVG XML 直接解析刀模线坐标（不要用 OpenCV 检测，渲染后线条会失真）**
+
 ```bash
 python3 << 'PYEOF'
-import cv2, numpy as np, os
+import re, os, cv2, numpy as np
 
-img = cv2.imread('/tmp/flat_render.png')
-H, W = img.shape[:2]
+svg_path = 'SVG文件路径'
+with open(svg_path, 'r') as f:
+    content = f.read()
 
-# 检测蓝色刀模线
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-mask_blue = cv2.inRange(hsv, np.array([100,50,50]), np.array([130,255,255]))
-lines = cv2.HoughLinesP(mask_blue, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+# 1. 从 XML 直接提取 cls-2（蓝色折线）和 cls-3（黑色切割线）的坐标
+# 比 OpenCV HoughLines 准确 100 倍，不受渲染抗锯齿影响
+all_h, all_v = [], []
 
-h_vals, v_vals = [], []
-if lines is not None:
-    for line in lines:
-        x1,y1,x2,y2 = line[0]
-        if abs(y2-y1) < 10: h_vals.append((y1+y2)//2)
-        elif abs(x2-x1) < 10: v_vals.append((x1+x2)//2)
+for m in re.finditer(r'class="([^"]*)"\s+d="([^"]*)"', content):
+    cls, d = m.group(1), m.group(2)
+    if 'cls-2' not in cls and 'cls-3' not in cls:
+        continue
+    
+    # 提取路径中的所有坐标点
+    coords = re.findall(r'([\d.]+)[,\s]+([\d.]+)', d)
+    if len(coords) < 2:
+        continue
+    
+    pts = [(float(c[0]), float(c[1])) for c in coords]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    w, h = max(xs)-min(xs), max(ys)-min(ys)
+    
+    # 判断是水平线还是垂直线（或接近的折线段）
+    if w < 5 and h > 20:
+        # 垂直线 → 收集 X 坐标
+        all_v.append(int(np.mean(xs)))
+    elif h < 5 and w > 20:
+        # 水平线 → 收集 Y 坐标
+        all_h.append(int(np.mean(ys)))
 
-# 聚类
-def cluster(vals, thresh=50):
+# 2. 聚类去重
+def cluster(vals, thresh=30):
     if not vals: return []
     vals = sorted(vals)
     clusters, cur = [], [vals[0]]
@@ -144,58 +161,82 @@ def cluster(vals, thresh=50):
     clusters.append(int(np.mean(cur)))
     return clusters
 
-h_lines = cluster(h_vals, 60)
-v_lines = cluster(v_vals, 60)
+h_lines = cluster(all_h, 40)
+v_lines = cluster(all_v, 40)
 
-# 如果检测不到足够线，用等分法回退
-if len(h_lines) < 2 or len(v_lines) < 2:
-    # 按 SVG viewBox 比例估算网格
-    # 常见布局：2-4 行 × 2-4 列
-    h_lines = [int(H*i/4) for i in range(5)]  # 4行
-    v_lines = [int(W*i/4) for i in range(5)]  # 4列
+# 3. 读取 viewBox 获取画板边界
+vb_match = re.search(r'viewBox="([^"]+)"', content)
+if vb_match:
+    vb_parts = [float(x) for x in vb_match.group(1).split()]
+    vb_w, vb_h = vb_parts[2], vb_parts[3]
+else:
+    vb_w, vb_h = 1000, 800
 
-print(f"Grid: {len(h_lines)-1} rows x {len(v_lines)-1} cols")
-print(f"H lines: {h_lines}")
-print(f"V lines: {v_lines}")
+print(f"viewBox: {vb_w:.0f}x{vb_h:.0f}")
+print(f"SVG 解析: {len(h_lines)} 条水平线, {len(v_lines)} 条垂直线")
+
+# 4. 如果 SVG 解析线不够，用等分回退
+if len(h_lines) < 2:
+    rows = 3 if vb_h < 600 else 4
+    h_lines = [int(vb_h * i / rows) for i in range(rows+1)]
+    print(f"  水平线不足，回退为 {rows} 行等分")
+if len(v_lines) < 2:
+    cols = 3 if vb_w < 600 else 4
+    v_lines = [int(vb_w * i / cols) for i in range(cols+1)]
+    print(f"  垂直线不足，回退为 {cols} 列等分")
+
+print(f"最终网格: {len(h_lines)-1} 行 x {len(v_lines)-1} 列")
+print(f"H: {h_lines}")
+print(f"V: {v_lines}")
+
+# 5. 计算面板尺寸（viewBox pt）
+panel_w = v_lines[1] - v_lines[0] if len(v_lines) > 1 else 0
+panel_h = h_lines[1] - h_lines[0] if len(h_lines) > 1 else 0
+print(f"面板尺寸(viewBox): {panel_w:.0f} x {panel_h:.0f} pt, 比例: {panel_w/panel_h:.3f}")
+
+# 6. 加载渲染后的平铺 PNG 并裁剪面板
+img = cv2.imread('/tmp/flat_render.png')
+img_h, img_w = img.shape[:2]
+scale_x = img_w / vb_w
+scale_y = img_h / vb_h
 
 out_dir = '/tmp/box_panels'
 os.makedirs(out_dir, exist_ok=True)
-
-# 制作标注图
 diagram = img.copy()
 font = cv2.FONT_HERSHEY_SIMPLEX
-labels = 'ABCDEFGH'
+row_labels = 'ABCDEFGH'
 
-panel_idx = 0
+panel_count = 0
 for row in range(len(h_lines)-1):
     for col in range(len(v_lines)-1):
-        x1, x2 = v_lines[col], v_lines[col+1]
-        y1, y2 = h_lines[row], h_lines[row+1]
+        # viewBox 坐标 → 图片像素坐标
+        x1 = int(v_lines[col] * scale_x)
+        y1 = int(h_lines[row] * scale_y)
+        x2 = int(v_lines[col+1] * scale_x)
+        y2 = int(h_lines[row+1] * scale_y)
+        
         panel = img[y1:y2, x1:x2]
-        if panel.shape[0] < 30 or panel.shape[1] < 30:
+        if panel.shape[0] < 20 or panel.shape[1] < 20:
             continue
         
-        # 过滤空白面板（内容极少）
+        # 过滤空白
         gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
         if gray.std() < 15:
             continue
         
-        # 简短编号 A1, B2, C3 ...
-        label = f"{labels[row]}{col+1}"
-        fname = f'{out_dir}/{label}.png'
-        cv2.imwrite(fname, panel)
+        label = f"{row_labels[row]}{col+1}"
+        cv2.imwrite(f'{out_dir}/{label}.png', panel)
         
-        # 标注图：绿色粗线 + 白色大字
+        # 标注图
         cv2.rectangle(diagram, (x1,y1), (x2,y2), (0,255,0), 4)
-        # 白色大文字
         (tw, th), _ = cv2.getTextSize(label, font, 2, 4)
         cv2.putText(diagram, label, (x1+(x2-x1-tw)//2, y1+(y2-y1+th)//2), font, 2, (255,255,255), 4)
         
-        panel_idx += 1
-        print(f"  {label}: {panel.shape[1]}x{panel.shape[0]} px")
+        panel_count += 1
+        print(f"  {label}: {panel.shape[1]}x{panel.shape[0]} px @ viewBox({v_lines[col]:.0f},{h_lines[row]:.0f})")
 
 cv2.imwrite(f'{out_dir}/00_diagram.png', diagram)
-print(f"Total: {panel_idx} panels -> {out_dir}/")
+print(f"总计: {panel_count} 个面板 → {out_dir}/")
 PYEOF
 ```
 
